@@ -24,7 +24,7 @@ async def run_agent():
             learned_stats = compute_learned_stats()
             regime = classify_regime(
                 signals["VIX"], signals["RSI"],
-                signals.get("SPX_5D_CHG"), thresholds,
+                signals.get("5D_CHG"), thresholds,
             )
             print(f"Regime: {regime} | VIX: {signals['VIX']} | RSI: {signals['RSI']}")
             if regime != last_regime:

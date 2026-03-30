@@ -112,7 +112,7 @@ def build_message(signals: dict, regime: str, stock_symbol: str,
         pct = thresholds.get("current_vix_pct", "?")
         thresh_line = f"_VIX is at the *{pct}th percentile* of the past year_\n"
 
-    spx_chg = signals.get("SPX_5D_CHG")
+    spx_chg = signals.get("5D_CHG")
     spx_line = f" | 5d chg: `{spx_chg:+.1f}%`" if spx_chg is not None else ""
 
     return (
