@@ -1,0 +1,12 @@
+services:
+  stock_ai_agent:
+    init: true
+    build:
+      dockerfile: Dockerfile
+    image: stock-ai-agent:latest
+    container_name: stock_ai_agent
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    restart: on-failure
