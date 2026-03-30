@@ -7,6 +7,6 @@ services:
     container_name: stock_ai_agent
     env_file:
       - .env
-    volumes:
-      - ./data:/app/data
+    ports:
+      - "8080:8080"
     restart: on-failure

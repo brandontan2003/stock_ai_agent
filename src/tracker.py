@@ -1,126 +1,157 @@
 """
-tracker.py — Outcome tracker for past signals.
+tracker.py — Outcome tracker backed by SQLite.
 
-Every time the agent fires a signal, we log:
-  - timestamp
-  - regime called
-  - price at signal time
-  - VIX + RSI at signal time
-
-30 days later, the agent checks the actual return and updates the accuracy log.
-The classifier reads this log to replace hardcoded stats with real observed performance.
+Replaces signals.json and outcomes.json with a single persistent DB.
+Mount a Railway volume at /app/data to survive deploys.
 """
 
-import json
+import sqlite3
 import os
 from datetime import datetime, timezone
 
-SIGNALS_FILE = "data/signals.json"
-OUTCOMES_FILE = "data/outcomes.json"
+DB_PATH = os.getenv("DB_PATH", "data/signals.db")
 
 
-def _load(path: str) -> list:
-    if not os.path.exists(path):
-        return []
-    with open(path, "r") as f:
-        return json.load(f)
+def _connect() -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def _save(path: str, data: list):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+def init_db():
+    """Create tables if they don't exist. Safe to call on every startup."""
+    with _connect() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT    NOT NULL,
+                regime      TEXT    NOT NULL,
+                price       REAL    NOT NULL,
+                vix         REAL    NOT NULL,
+                rsi         REAL    NOT NULL,
+                ticker      TEXT    NOT NULL,
+                resolved    INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS outcomes (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id           INTEGER NOT NULL REFERENCES signals(id),
+                regime              TEXT    NOT NULL,
+                entry_price         REAL    NOT NULL,
+                exit_price          REAL    NOT NULL,
+                actual_return_pct   REAL    NOT NULL,
+                days_held           INTEGER NOT NULL,
+                signal_timestamp    TEXT    NOT NULL,
+                resolved_timestamp  TEXT    NOT NULL
+            );
+        """)
 
 
 def log_signal(regime: str, signals: dict, stock_ticker: str):
-    """Called every time the agent fires a regime-change alert."""
-    records = _load(SIGNALS_FILE)
-    records.append({
-        "id": len(records),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "regime": regime,
-        "price": signals[stock_ticker],
-        "vix": signals["VIX"],
-        "rsi": signals["RSI"],
-        "ticker": stock_ticker,
-        "resolved": False,
-    })
-    _save(SIGNALS_FILE, records)
+    """Log a new regime-change signal."""
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO signals (timestamp, regime, price, vix, rsi, ticker)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                regime,
+                signals[stock_ticker],
+                signals["VIX"],
+                signals["RSI"],
+                stock_ticker,
+            ),
+        )
+    print(f"Signal logged: {regime}")
 
 
 def resolve_outcomes(current_prices: dict):
-    """
-    Called on every poll. Checks if any unresolved signals are 30+ days old.
-    If so, computes the actual return and writes to outcomes.json.
-    current_prices: {ticker: current_price}
-    """
-    records = _load(SIGNALS_FILE)
-    outcomes = _load(OUTCOMES_FILE)
-    updated = False
+    """Resolve any signals that are 30+ days old."""
+    with _connect() as conn:
+        unresolved = conn.execute(
+            "SELECT * FROM signals WHERE resolved = 0"
+        ).fetchall()
 
-    for record in records:
-        if record["resolved"]:
-            continue
+        for record in unresolved:
+            signal_time = datetime.fromisoformat(record["timestamp"])
+            age_days = (datetime.now(timezone.utc) - signal_time).days
 
-        signal_time = datetime.fromisoformat(record["timestamp"])
-        age_days = (datetime.now(timezone.utc) - signal_time).days
+            if age_days < 30:
+                continue
 
-        if age_days < 30:
-            continue
+            ticker = record["ticker"]
+            if ticker not in current_prices:
+                continue
 
-        ticker = record["ticker"]
-        if ticker not in current_prices:
-            continue
+            entry_price = record["price"]
+            exit_price = current_prices[ticker]
+            actual_return_pct = ((exit_price - entry_price) / entry_price) * 100
 
-        entry_price = record["price"]
-        exit_price = current_prices[ticker]
-        actual_return_pct = ((exit_price - entry_price) / entry_price) * 100
-
-        outcome = {
-            "signal_id": record["id"],
-            "regime": record["regime"],
-            "entry_price": entry_price,
-            "exit_price": round(exit_price, 2),
-            "actual_return_pct": round(actual_return_pct, 2),
-            "days_held": age_days,
-            "signal_timestamp": record["timestamp"],
-            "resolved_timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        outcomes.append(outcome)
-        record["resolved"] = True
-        updated = True
-        print(f"Resolved signal #{record['id']}: {record['regime']} → {actual_return_pct:+.1f}% over {age_days}d")
-
-    if updated:
-        _save(SIGNALS_FILE, records)
-        _save(OUTCOMES_FILE, outcomes)
-
-    return outcomes
+            conn.execute(
+                """INSERT INTO outcomes
+                   (signal_id, regime, entry_price, exit_price,
+                    actual_return_pct, days_held, signal_timestamp, resolved_timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record["id"],
+                    record["regime"],
+                    entry_price,
+                    round(exit_price, 2),
+                    round(actual_return_pct, 2),
+                    age_days,
+                    record["timestamp"],
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.execute(
+                "UPDATE signals SET resolved = 1 WHERE id = ?", (record["id"],)
+            )
+            print(
+                f"Resolved signal #{record['id']}: "
+                f"{record['regime']} → {actual_return_pct:+.1f}% over {age_days}d"
+            )
 
 
 def compute_learned_stats() -> dict:
-    """
-    Reads outcomes.json and computes per-regime observed stats.
-    Returns a dict keyed by regime with median return and sample size.
-    Falls back gracefully if no data yet.
-    """
-    outcomes = _load(OUTCOMES_FILE)
-    if not outcomes:
+    """Compute per-regime performance stats from resolved outcomes."""
+    with _connect() as conn:
+        rows = conn.execute("SELECT regime, actual_return_pct FROM outcomes").fetchall()
+
+    if not rows:
         return {}
 
     from collections import defaultdict
     import statistics
 
     by_regime = defaultdict(list)
-    for o in outcomes:
-        by_regime[o["regime"]].append(o["actual_return_pct"])
+    for row in rows:
+        by_regime[row["regime"]].append(row["actual_return_pct"])
 
     stats = {}
     for regime, returns in by_regime.items():
         stats[regime] = {
             "median_return": round(statistics.median(returns), 1),
-            "mean_return": round(statistics.mean(returns), 1),
-            "sample_size": len(returns),
-            "win_rate": round(sum(1 for r in returns if r > 0) / len(returns) * 100, 1),
+            "mean_return":   round(statistics.mean(returns), 1),
+            "sample_size":   len(returns),
+            "win_rate":      round(sum(1 for r in returns if r > 0) / len(returns) * 100, 1),
         }
     return stats
+
+
+def get_all_signals() -> list:
+    """Return all signals as a list of dicts — useful for debugging."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM signals ORDER BY timestamp DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_all_outcomes() -> list:
+    """Return all resolved outcomes as a list of dicts."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM outcomes ORDER BY resolved_timestamp DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]

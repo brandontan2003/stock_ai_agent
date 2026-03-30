@@ -3,7 +3,7 @@ import asyncio
 from telegram import Bot
 from telegram.error import TelegramError
 
-from stock_ai_agent.src.config import bot_token, chat_id
+from src.config import bot_token, chat_id
 
 
 async def send_alert(message: str, retries: int = 3):
