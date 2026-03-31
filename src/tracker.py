@@ -1,13 +1,13 @@
 """
 tracker.py — Outcome tracker backed by SQLite.
-
-Replaces signals.json and outcomes.json with a single persistent DB.
-Mount a Railway volume at /app/data to survive deploys.
 """
 
 import sqlite3
 import os
 from datetime import datetime, timezone
+import yfinance as yf
+from src.classifier import classify_regime, get_dynamic_thresholds
+from src.data import compute_rsi, get_trade_outcome
 
 DB_PATH = os.getenv("DB_PATH", "data/signals.db")
 
@@ -48,6 +48,59 @@ def init_db():
         """)
 
 
+def backfill_signals(stock_ticker: str, days: int = 365):
+    with _connect() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+        if count > 0:
+            print(f"Skipping backfill — {count} signals already in DB")
+            return
+
+    print(f"Backfilling {days} days of historical signals...")
+
+    vix_hist   = yf.Ticker("^VIX").history(period=f"{days}d")["Close"]
+    stock_hist = yf.Ticker(stock_ticker).history(period=f"{days}d")["Close"]
+    thresholds = get_dynamic_thresholds()
+
+    # Build date-keyed lookup to avoid timezone mismatch
+    stock_list  = list(stock_hist.items())
+    stock_by_date = {d.date(): i for i, (d, _) in enumerate(stock_list)}
+
+    last = None
+    for date, vix_val in vix_hist.items():
+        day = date.date()
+        if day not in stock_by_date:
+            continue
+
+        idx = stock_by_date[day]
+        if idx < 14:
+            continue
+
+        price   = float(stock_list[idx][1])
+        rsi_val = float(compute_rsi(stock_hist.iloc[:idx + 1]).iloc[-1])
+        chg     = ((price - float(stock_list[idx - 5][1])) / float(stock_list[idx - 5][1])) * 100 if idx >= 5 else None
+        regime  = classify_regime(float(vix_val), rsi_val, chg, thresholds)
+
+        if regime != last:
+            with _connect() as conn:
+                conn.execute(
+                    """INSERT INTO signals
+                       (timestamp, regime, price, vix, rsi, ticker)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        date.isoformat(),
+                        regime,
+                        round(price, 2),
+                        round(float(vix_val), 2),
+                        round(rsi_val, 2),
+                        stock_ticker,
+                    ),
+                )
+            print(f"Backfilled: {day} → {regime}")
+            last = regime
+
+    print("Backfill complete.")
+
+
 def log_signal(regime: str, signals: dict, stock_ticker: str):
     """Log a new regime-change signal."""
     with _connect() as conn:
@@ -66,7 +119,7 @@ def log_signal(regime: str, signals: dict, stock_ticker: str):
     print(f"Signal logged: {regime}")
 
 
-def resolve_outcomes(current_prices: dict):
+def resolve_outcomes():
     """Resolve any signals that are 30+ days old."""
     with _connect() as conn:
         unresolved = conn.execute(
@@ -75,19 +128,21 @@ def resolve_outcomes(current_prices: dict):
 
         for record in unresolved:
             signal_time = datetime.fromisoformat(record["timestamp"])
-            age_days = (datetime.now(timezone.utc) - signal_time).days
-
-            if age_days < 30:
-                continue
 
             ticker = record["ticker"]
-            if ticker not in current_prices:
+            entry_price = record["price"]
+            result = get_trade_outcome(ticker, signal_time)
+            if result is None:
                 continue
 
-            entry_price = record["price"]
-            exit_price = current_prices[ticker]
-            actual_return_pct = ((exit_price - entry_price) / entry_price) * 100
-
+            exit_date  = datetime.fromisoformat(str(result["exit_date"]))
+            exit_price = result["exit_price"]
+            if exit_price is None:
+                continue
+            
+            actual_return_pct = result["return_pct"]
+            age_days = (exit_date - signal_time).days
+            
             conn.execute(
                 """INSERT INTO outcomes
                    (signal_id, regime, entry_price, exit_price,
@@ -101,7 +156,7 @@ def resolve_outcomes(current_prices: dict):
                     round(actual_return_pct, 2),
                     age_days,
                     record["timestamp"],
-                    datetime.now(timezone.utc).isoformat(),
+                    exit_date.isoformat(),
                 ),
             )
             conn.execute(
