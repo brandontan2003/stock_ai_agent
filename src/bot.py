@@ -1,9 +1,12 @@
 import asyncio
+import logging
 
 from telegram import Bot
 from telegram.error import TelegramError
 
 from src.config import bot_token, chat_id
+
+logger = logging.getLogger(__name__)
 
 
 async def send_alert(message: str, retries: int = 3):
@@ -16,4 +19,4 @@ async def send_alert(message: str, retries: int = 3):
             if attempt < retries - 1:
                 await asyncio.sleep(5)
             else:
-                print(f"Failed to send Telegram alert after {retries} attempts: {e}")
+                logger.error(f"Failed to send Telegram alert after {retries} attempts: {e}")

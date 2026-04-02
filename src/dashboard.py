@@ -3,20 +3,25 @@ dashboard.py — Lightweight read-only web dashboard.
 Exposes /signals and /outcomes as JSON endpoints.
 Serves a simple HTML dashboard at /.
 """
+import logging
+from datetime import datetime
 
 from aiohttp import web
 from src.tracker import get_all_signals, get_all_outcomes, compute_learned_stats
 import json
 
+logger = logging.getLogger(__name__)
 PORT = 8080
 
 async def handle_index(request):
+    date_format = "%d/%m/%Y"
+    timestamp_format = "%Y-%m-%dT%H:%M:%S%z"
     signals  = get_all_signals()
     outcomes = get_all_outcomes()
     stats    = compute_learned_stats()
 
     rows = "".join(
-        f"<tr><td>{s['id']}</td><td>{s['timestamp'][:19]}</td>"
+        f"<tr><td>{s['id']}</td><td>{datetime.strptime(s['timestamp'], timestamp_format).strftime(date_format)}</td>"
         f"<td>{s['regime']}</td><td>{s['vix']}</td>"
         f"<td>{s['rsi']}</td><td>{s['price']}</td>"
         f"<td>{'✅' if s['resolved'] else '⏳'}</td></tr>"
@@ -24,7 +29,10 @@ async def handle_index(request):
     )
 
     outcome_rows = "".join(
-        f"<tr><td>{o['regime']}</td><td>{o['entry_price']}</td>"
+        f"<tr><td>{o['regime']}</td>"
+        f"<td>{datetime.strptime(o['signal_timestamp'], timestamp_format).strftime(date_format)}</td>"
+        f"<td>{datetime.strptime(o['resolved_timestamp'], timestamp_format).strftime(date_format)}</td>"
+        f"<td>{o['entry_price']}</td>"
         f"<td>{o['exit_price']}</td>"
         f"<td style='color:{'green' if o['actual_return_pct'] > 0 else 'red'}'>"
         f"{o['actual_return_pct']:+.1f}%</td>"
@@ -70,7 +78,7 @@ async def handle_index(request):
 
   <h2>Outcomes</h2>
   <table>
-    <tr><th>Regime</th><th>Entry</th><th>Exit</th><th>Return</th><th>Held</th></tr>
+    <tr><th>Regime</th><th>Entry Date</th><th>Exit Date</th><th>Entry</th><th>Exit</th><th>Return</th><th>Days Held</th></tr>
     {outcome_rows or '<tr><td colspan=5 class="empty">No outcomes yet</td></tr>'}
   </table>
 </body>
@@ -99,4 +107,4 @@ async def start_dashboard():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"Dashboard running on port {PORT}")
+    logger.info(f"Dashboard running on port {PORT}")
