@@ -156,7 +156,7 @@ def log_signal(regime: str, signals: dict, stock_ticker: str):
             """INSERT INTO signals (timestamp, regime, price, vix, rsi, ticker)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (
-                datetime.now(timezone.utc).isoformat(),
+                datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
                 regime,
                 signals[stock_ticker],
                 signals["VIX"],
