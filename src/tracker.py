@@ -168,7 +168,6 @@ def backfill_signals(stock_ticker: str, days: int = 365):
         "price": stock_hist
     }).dropna()
 
-    print(combined_df)
     if len(combined_df) < days:
         logger.warning(f"Not enough overlapping trading days: {len(combined_df)} < {days}")
 
