@@ -10,30 +10,37 @@ falling back to historical priors when the tracker has insufficient data.
 import yfinance as yf
 
 # Fallback priors — used until the outcome tracker has real data
+# Extremely high levels of implied volatility often occur near market bottoms.
+# Source: https://www.investopedia.com/articles/optioninvestor/09/implied-volatility-contrary-indicator.asp
+# Equity returns have tended to be higher following periods of elevated volatility.
+# Source: https://www.troweprice.com/institutional/ac/en/insights/articles/2022/q2/volatility-spikes-may-not-be-good-sell-signals.html
+
+# The VIX Index is a calculation designed to produce a measure of constant, 30-day expected volatility of the U.S. stock market.
+# https://www.cboe.com/tradable_products/vix/
 HISTORICAL_PRIORS = {
     "extreme_panic": {
         "label": "🚨 EXTREME PANIC",
-        "prior_note": "VIX>90th pct — historically preceded +18% median gain over 60d (2008, 2020, 2022)",
-        "signal": "Strong contrarian buy zone — if you have dry powder",
+        "prior_note": "VIX at extreme levels (top decile) has historically coincided with periods of market stress and, on average, stronger forward returns, though timing is highly uncertain",
+        "signal": "Strong contrarian zone — scale in cautiously if risk-managed",
     },
     "panic": {
         "label": "🔴 PANIC",
-        "prior_note": "VIX 70–90th pct — associated with +11% median gain over 30d",
-        "signal": "Elevated risk, potential opportunity for long-term buyers",
+        "prior_note": "Elevated VIX levels are associated with increased volatility and potential for higher future returns, but drawdowns can persist",
+        "signal": "High risk, potential opportunity — avoid aggressive timing",
     },
     "fear_confirmed": {
         "label": "🟠 FEAR (confirmed)",
-        "prior_note": "Price decline + elevated VIX — watch for VIX peak before entering",
-        "signal": "Not yet a buy signal. Monitor for stabilisation.",
+        "prior_note": "Rising volatility during drawdowns — markets may not have bottomed yet",
+        "signal": "Not a buy signal — wait for stabilisation or reversal",
     },
     "fear": {
         "label": "🟡 FEAR",
-        "prior_note": "VIX 40–70th pct — moderate caution",
-        "signal": "Hold positions, avoid panic selling",
+        "prior_note": "Moderately elevated volatility — uncertainty increasing",
+        "signal": "Stay cautious, avoid emotional decisions",
     },
     "calm": {
         "label": "🟢 CALM",
-        "prior_note": "No directional signal",
+        "prior_note": "Low volatility — no strong directional edge",
         "signal": "Normal market conditions",
     },
 }
