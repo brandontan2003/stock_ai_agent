@@ -6,6 +6,8 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 
+import pandas as pd
+from scipy.stats import percentileofscore
 import yfinance as yf
 
 from src.classifier import classify_regime
@@ -48,105 +50,180 @@ def init_db():
                 signal_timestamp    DATETIME    NOT NULL,
                 resolved_timestamp  DATETIME    NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS metadata (
+                key     TEXT PRIMARY KEY,
+                value   TEXT NOT NULL
+            );
         """)
 
 
-def _rolling_thresholds(vix_series, current_idx: int, window: int = 252) -> dict:
+def is_backfill_complete() -> bool:
+    """Check whether a successful backfill has been recorded in metadata."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key = 'backfill_complete'"
+        ).fetchone()
+    return row is not None and row["value"] == "1"
+
+
+def mark_backfill_complete(days: int, ticker: str):
+    """Record that backfill completed successfully, with context."""
+    with _connect() as conn:
+        for key, value in [
+            ("backfill_complete", "1"),
+            ("backfill_days", str(days)),
+            ("backfill_ticker", ticker),
+            ("backfill_timestamp", datetime.now(timezone.utc).isoformat()),
+        ]:
+            conn.execute(
+                """INSERT INTO metadata (key, value) VALUES (?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (key, value),
+            )
+
+
+def _rolling_thresholds(vix_series, current_idx: int, window: int = 60) -> dict:
     """
     Compute regime thresholds using only VIX data available BEFORE current_idx.
-
-    This is the fix for lookahead bias: each historical day is classified
-    using only the percentile distribution that existed at that point in time
-    — exactly as the live system does it.
-
-    A day in March 2023 uses only VIX data up to March 2023.
-    It never sees October 2023 or beyond.
+    Avoids lookahead bias by considering only past data.
+    Returns calm_max, fear_max, panic_max, and current percentile of current VIX.
     """
-    start = max(0, current_idx - window)
-    past_vix = vix_series.iloc[start:current_idx]  # strictly before today
-
-    if len(past_vix) < 30:
-        # Not enough history yet — fall back to hardcoded defaults
+    if current_idx == 0:
+        # first day → no history, return defaults
         return {"calm_max": 20.0, "fear_max": 30.0, "panic_max": 40.0, "current_vix_pct": None}
 
-    current_vix = float(vix_series.iloc[current_idx])
-    pct_rank = float((past_vix < current_vix).mean() * 100)
+    past_vix = vix_series.iloc[:current_idx].dropna()  # strictly before today
+    if len(past_vix) < window:
+        # insufficient data → use fallback defaults
+        return {"calm_max": 20.0, "fear_max": 30.0, "panic_max": 40.0, "current_vix_pct": None}
+
+    current_vix = vix_series.iloc[current_idx]
+    calm_max = round(float(past_vix.quantile(0.40)), 2)
+    fear_max = round(float(past_vix.quantile(0.70)), 2)
+    panic_max = round(float(past_vix.quantile(0.90)), 2)
+
+    # Percentile rank using scipy for accuracy
+    current_vix_pct = round(percentileofscore(past_vix, current_vix, kind="weak"), 1)
 
     return {
-        "calm_max": round(float(past_vix.quantile(0.40)), 2),
-        "fear_max": round(float(past_vix.quantile(0.70)), 2),
-        "panic_max": round(float(past_vix.quantile(0.90)), 2),
-        "current_vix_pct": round(pct_rank, 1),
+        "calm_max": calm_max,
+        "fear_max": fear_max,
+        "panic_max": panic_max,
+        "current_vix_pct": current_vix_pct,
     }
 
 
 def backfill_signals(stock_ticker: str, days: int = 365):
-    with _connect() as conn:
-        count = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
-        if count > 0:
-            logger.info(f"Skipping backfill — {count} signals already in DB")
-            return
+    """
+    Backfill historical regime signals into the database.
 
-    # Fetch 2x the window so each day in the backfill has a full rolling
-    # lookback available — avoids cold-start bias at day 1.
-    fetch_days = days + 365
-    logger.info(f"Backfilling {days} days of historical signals (fetching {fetch_days}d for warm-up)...")
+    Skips if a successful backfill is already recorded in metadata.
+
+    Crash safety: all inserts are batched and committed in a single atomic
+    transaction at the end. If the process crashes mid-loop, nothing is
+    written — the DB stays clean and the backfill retries on next startup.
+    The backfill_complete flag is only set after the transaction succeeds.
+    """
+    if is_backfill_complete():
+        logger.info("Skipping backfill — already completed (metadata.backfill_complete=1)")
+        return
+
+    # Any signals present without a backfill_complete flag are orphans from
+    # a previous crash. Clear them so we start clean.
+    with _connect() as conn:
+        orphaned = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+        if orphaned > 0:
+            logger.warning(
+                f"Found {orphaned} orphaned signals without backfill_complete — "
+                f"clearing and re-running backfill."
+            )
+            conn.execute("DELETE FROM signals")
+
+    # yfinance period="Nd" is calendar days, not trading days.
+    # Trading days ≈ calendar days × (252/365).
+    # We need `days` trading days to log + 252 trading days of warm-up.
+    # Convert to calendar days: (days + 252) ÷ (252/365) + 10-day buffer.
+    total_trading_needed = days + 252
+    fetch_days = int(total_trading_needed / (252 / 365)) + 10
+    logger.info(
+        f"Backfilling {days} trading days of signals "
+        f"(fetching {fetch_days} calendar days for warm-up)..."
+    )
 
     vix_hist = yf.Ticker("^VIX").history(period=f"{fetch_days}d")["Close"]
     stock_hist = yf.Ticker(stock_ticker).history(period=f"{fetch_days}d")["Close"]
 
-    vix_list = list(vix_hist.items())
-    stock_list = list(stock_hist.items())
-    stock_by_date = {d.date(): i for i, (d, _) in enumerate(stock_list)}
+    # Convert both to UTC
+    vix_hist = vix_hist.tz_convert("UTC")
+    stock_hist = stock_hist.tz_convert("UTC")
 
-    # Only log signals within the requested backfill window (most recent `days`)
-    cutoff_idx = len(vix_list) - days
+    # Convert index to dates (strip timestamp)
+    vix_hist.index = vix_hist.index.normalize()
+    stock_hist.index = stock_hist.index.normalize()
 
+    # Align dates
+    combined_df = pd.DataFrame({
+        "vix": vix_hist,
+        "price": stock_hist
+    }).dropna()
+
+    print(combined_df)
+    if len(combined_df) < days:
+        logger.warning(f"Not enough overlapping trading days: {len(combined_df)} < {days}")
+
+    # Collect all inserts first — write atomically at the end.
+    # Nothing touches the DB until the full loop completes successfully.
+    inserts = []
     last = None
-    for vix_idx, (date, vix_val) in enumerate(vix_list):
-        if vix_idx < cutoff_idx:
-            continue  # warm-up period — accumulate history, don't log
 
-        day = date.date()
-        if day not in stock_by_date:
-            continue
+    # Only log signals for the most recent `days` trading days
+    start_idx = max(0, len(combined_df) - days)
 
-        stock_idx = stock_by_date[day]
-        if stock_idx < 14:
-            continue
+    for idx in range(start_idx, len(combined_df)):
+        row = combined_df.iloc[idx]
+        thresholds = _rolling_thresholds(combined_df["vix"], idx)
 
-        # Rolling thresholds: only past VIX data, never future
-        thresholds = _rolling_thresholds(vix_hist, vix_idx)
+        price = float(row["price"])
+        vix_val = float(row["vix"])
+        rsi_val = float(compute_rsi(combined_df["price"].iloc[:idx + 1]).iloc[-1])
 
-        price = float(stock_list[stock_idx][1])
-        rsi_val = float(compute_rsi(stock_hist.iloc[:stock_idx + 1]).iloc[-1])
-        chg = (
-            ((price - float(stock_list[stock_idx - 5][1])) / float(stock_list[stock_idx - 5][1])) * 100
-            if stock_idx >= 5 else None
-        )
+        # 5-day price change, or None if not enough history
+        if idx >= 5:
+            chg = ((price - combined_df["price"].iloc[idx - 5]) / combined_df["price"].iloc[idx - 5]) * 100
+        else:
+            chg = None
+
         regime = classify_regime(float(vix_val), rsi_val, chg, thresholds)
+        timestamp = combined_df.index[idx]
 
         if regime != last:
-            with _connect() as conn:
-                conn.execute(
-                    """INSERT INTO signals
-                       (timestamp, regime, price, vix, rsi, ticker)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (
-                        date.isoformat(),
-                        regime,
-                        round(price, 2),
-                        round(float(vix_val), 2),
-                        round(rsi_val, 2),
-                        stock_ticker,
-                    ),
-                )
-
+            inserts.append((
+                timestamp.to_pydatetime().replace(tzinfo=timezone.utc).isoformat(),
+                regime,
+                round(price, 2),
+                round(float(vix_val), 2),
+                round(rsi_val, 2),
+                stock_ticker,
+            ))
             logger.info(
-                f"Backfilled: {day} -> {regime} (calm<{thresholds['calm_max']}, panic>{thresholds['panic_max']})")
+                f"Backfilled {timestamp.date()} -> {regime} "
+                f"(calm<{thresholds['calm_max']}, fear<{thresholds['fear_max']}, panic<{thresholds['panic_max']}) "
+                f"VIX percentile={thresholds['current_vix_pct']}"
+            )
             last = regime
 
-    logger.info("Backfill complete.")
+    # Single atomic commit: all signals land together or not at all.
+    with _connect() as conn:
+        conn.executemany(
+            """INSERT INTO signals (timestamp, regime, price, vix, rsi, ticker)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            inserts,
+        )
+
+    # Only flag complete AFTER the transaction succeeds.
+    mark_backfill_complete(days, stock_ticker)
+    logger.info(f"Backfill complete — {len(inserts)} signals written.")
 
 
 def log_signal(regime: str, signals: dict, stock_ticker: str):
